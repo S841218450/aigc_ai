@@ -8,7 +8,7 @@ pipeline {
 
     options {
         timestamps()
-        timeout(time: 60, unit: 'MINUTES')   // 本项目依赖 langchain/chromadb，构建耗时长
+        timeout(time: 120, unit: 'MINUTES')   // 首次构建需下载 langchain/chromadb 等大依赖，超时给足
         disableConcurrentBuilds()
     }
 
