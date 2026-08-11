@@ -1,4 +1,7 @@
+from typing import Optional
+
 from fastapi import APIRouter
+from pyarrow.lib import Field
 from pydantic import BaseModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -74,7 +77,7 @@ def _get_inspiration_chain():
 
 
 class PromptGenerateRequest(BaseModel):
-    prompt: str = ""
+    prompt: Optional[str] = ""
 
 
 @router.post("/generate")
