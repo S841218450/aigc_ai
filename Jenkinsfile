@@ -71,7 +71,9 @@ pipeline {
 
                             echo "等待健康检查通过"
                             for i in \$(seq 1 120); do
-                                if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+                                # Jenkins 自身也在容器内，curl 127.0.0.1 连不到宿主机映射端口，
+                                # 改为在应用容器内部探测 /health
+                                if docker exec aigc-ai python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)" >/dev/null 2>&1; then
                                     echo "✅ 健康检查通过"
                                     break
                                 fi
