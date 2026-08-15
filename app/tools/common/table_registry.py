@@ -119,7 +119,7 @@ class StructuredTableRegistry:
     def _ensure_init(self):
         if self._tables_col is not None:
             return
-        self._client = MongoClient(settings.mongodb_url)
+        self._client = MongoClient(settings.mongodb_url, **settings.mongodb_conn_kwargs)
         db = self._client[settings.mongodb_db_name]
         self._tables_col = db["kb_structured_tables"]
         self._rows_col = db["kb_structured_rows"]

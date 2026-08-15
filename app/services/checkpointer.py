@@ -22,7 +22,7 @@ class CheckpointerService:
 
     def get_checkpointer(self, collection_name: str = "checkpoints") -> MongoDBSaver:
         if self._checkpointer is None:
-            self._client = MongoClient(settings.mongodb_url)
+            self._client = MongoClient(settings.mongodb_url, **settings.mongodb_conn_kwargs)
             db = self._client[settings.mongodb_db_name]
             collection = db[collection_name]
 

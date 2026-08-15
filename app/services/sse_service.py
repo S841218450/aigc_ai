@@ -5,6 +5,8 @@ from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 from fastapi.responses import StreamingResponse
 
+from app.services.node_status import get_step_name
+
 
 class SSEEvent:
     """SSE 事件封装（带 seq_id 序列号）"""
@@ -122,8 +124,9 @@ class SSEService:
 
         except asyncio.CancelledError:
             yield self.next_event("cancelled", "连接已断开").to_sse()
-        except Exception as e:
-            yield self.next_event("error", f"服务异常: {str(e)}").to_sse()
+        except Exception:
+            # 不透出内部错误原因给前端，仅提示服务异常
+            yield self.next_event("error", "服务异常，请稍后重试").to_sse()
         finally:
             if pending and not pending.done():
                 pending.cancel()
@@ -147,10 +150,6 @@ def sse_event(sse: SSEService, event_type: str, status: str, data: Any = None) -
 
 def sse_done(sse: SSEService, data: Any = None) -> SSEEvent:
     return sse.next_event(event_type="done", status="执行完成", data=data)
-
-
-def sse_error(sse: SSEService, msg: str) -> SSEEvent:
-    return sse.next_event(event_type="error", status=msg)
 
 
 def sse_interrupt(sse: SSEService, thread_id: Any, interrupt_data: Any) -> SSEEvent:
@@ -246,51 +245,64 @@ async def graph_to_sse_events(
                     pass
                 return
 
-            # 节点/流程错误（graph.py 异常时 yield "error", {"msg", "stack"}）
+            # 节点/流程错误（文生图/图生图 graph 异常时 yield "error", {"failed_node"}）
             if node_name == "error":
                 has_error = True
-                err_msg = (
-                    state_update.get("msg", str(state_update))
-                    if isinstance(state_update, dict) else str(state_update)
-                )
-                stack = state_update.get("stack", "") if isinstance(state_update, dict) else ""
-                yield sse_event(
-                    sse,
-                    event_type="error",
-                    status=f"执行出错：{err_msg}",
-                    data={"messages": err_msg, "stack": stack},
-                )
+                # 流程节点出错：只告知哪个步骤出问题，不透出原始节点名与错误原因
+                if isinstance(state_update, dict) and state_update.get("failed_node") is not None:
+                    step_name = get_step_name(state_update.get("failed_node")) or "当前步骤"
+                    yield sse_event(
+                        sse,
+                        event_type="error",
+                        status=f"「{step_name}」执行出错，请重试",
+                        data={"threadId": thread_id},
+                    )
+                else:
+                    # 兼容知识库等旧流程（graph 直接 yield {"msg"}）：仅透出提示语，不附堆栈
+                    err_msg = (
+                        state_update.get("msg", str(state_update))
+                        if isinstance(state_update, dict) else str(state_update)
+                    )
+                    yield sse_event(
+                        sse,
+                        event_type="error",
+                        status=f"执行出错：{err_msg}",
+                        data={"messages": err_msg},
+                    )
                 continue
 
             # 节点开始信号（节点内 StreamWriter 在模型调用前发出，先展示"进行中"状态）
             if node_name == "node_start":
-                node = (state_update or {}).get("node", "") if isinstance(state_update, dict) else ""
-                node_info = node_map.get(node, {
-                    "type": f"step_{node}",
-                    "status": f"正在执行 {node}",
-                })
+                payload = state_update if isinstance(state_update, dict) else {}
+                node = payload.get("node", "")
+                node_info = node_map.get(node, {})
+                # 不透出原始节点名：未知节点统一用通用类型/中文提示
+                data = {"messages": payload.get("messages") or "正在执行该步骤"}
+                for key, value in payload.items():
+                    if key in ("node", "messages"):
+                        continue
+                    data[key] = value
                 yield sse_event(
                     sse,
-                    event_type=node_info["type"],
-                    status=node_info["status"],
-                    data={"messages": f"开始执行 {node}"},
+                    event_type=node_info.get("type") or "step_process",
+                    status=payload.get("status") or node_info.get("status") or "正在执行该步骤",
+                    data=data,
                 )
                 continue
 
             # 人工中断
             if node_name == "__interrupt__":
                 interrupt_payload = state_update[0].value if state_update else {}
-                # 节点失败型中断（await_retry_node）：以 error 事件返回失败原因，
-                # 前端收到 error 后调用 /retry 从失败节点继续执行，避免误导为人工介入
+                # 节点失败型中断（retry_node）：以 error 事件返回，仅告知哪个步骤失败，
+                # 不透出原始节点名与错误原因；前端收到 error 后调用 /retry 从失败节点继续执行
                 if interrupt_payload.get("retry_target"):
+                    step_name = get_step_name(interrupt_payload.get("retry_target")) or "当前步骤"
                     yield sse_event(
                         sse,
                         event_type="error",
-                        status=f"节点「{interrupt_payload['retry_target']}」执行失败，等待重试",
+                        status=f"「{step_name}」执行失败，等待重试",
                         data={
                             "threadId": thread_id,
-                            "retry_target": interrupt_payload.get("retry_target"),
-                            "node_error": interrupt_payload.get("node_error"),
                             "retry_count": interrupt_payload.get("retry_count"),
                         },
                     )
@@ -303,16 +315,13 @@ async def graph_to_sse_events(
                     pass
                 return
 
-            # 正常节点完成事件
-            node_info = node_map.get(node_name, {
-                "type": f"step_{node_name}",
-                "status": f"正在执行 {node_name}",
-            })
+            # 正常节点完成事件（未映射节点用通用类型/中文提示，不透出原始节点名）
+            node_info = node_map.get(node_name, {})
             data = build_node_data(node_name, state_update)
             yield sse_event(
                 sse,
-                event_type=node_info["type"],
-                status=node_info["status"],
+                event_type=node_info.get("type") or "step_process",
+                status=node_info.get("status") or "该步骤执行完成",
                 data=data,
             )
 
@@ -320,7 +329,8 @@ async def graph_to_sse_events(
             yield sse_done(sse)
     except asyncio.CancelledError:
         yield sse_event(sse, "cancelled", "用户已取消")
-    except Exception as e:
-        yield sse_error(sse, str(e))
+    except Exception:
+        # 不透出内部错误原因，仅提示执行异常
+        yield sse_event(sse, "error", "执行异常，请重试")
     finally:
         task_manager.unregister(thread_id)

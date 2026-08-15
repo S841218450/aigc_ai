@@ -15,7 +15,9 @@ def parse_chat_history(items: list) -> list:
     把 Java 传入的历史消息解析为统一的 [{role, content}, ...]。
     兼容两种格式：
     1. 原生记录 {question, answer, ...}：一条记录 = user(question) + assistant(answer)。
-       answer 为空代表"该轮尚未回答"（即最刚发出的消息，其 question 已由 query 字段单独传入）→ 整条跳过，避免与 query 重复注入
+       answer 为空时**仍保留 user 消息**（如"回答的时候请在前缀称呼我为西米"这类指令
+       往往只有 user 没有 assistant，若整条跳过会导致历史指令丢失），只是不追加 assistant；
+       当前进行中消息（question 与当前 query 相同、answer 空）由调用方按 query 去重。
     2. 精简格式 {role, content}
     """
     msgs = []
@@ -24,12 +26,11 @@ def parse_chat_history(items: list) -> list:
         # 原生格式：通过 question/answer 区分 role
         if it.get("question") is not None or it.get("answer") is not None:
             answer = (it.get("answer") or "").strip()
-            if not answer:
-                continue  # 当前进行中消息（answer 为空），跳过
             question = (it.get("question") or "").strip()
             if question:
                 msgs.append({"role": "user", "content": question})
-            msgs.append({"role": "assistant", "content": answer})
+            if answer:
+                msgs.append({"role": "assistant", "content": answer})
         # 精简格式
         else:
             role = (it.get("role") or "").lower()
@@ -42,19 +43,18 @@ def parse_chat_history(items: list) -> list:
 def format_history_msgs(msgs: list) -> str:
     """
     把消息列表格式化为可注入摘要的文本。
-    兼容两种输入：已解析的 [{role, content}] 或 Java 原生记录 {question, answer}（answer 为空则跳过）
+    兼容两种输入：已解析的 [{role, content}] 或 Java 原生记录 {question, answer}（answer 为空时保留 user 行）
     """
     lines = []
     for m in msgs:
         it = m.model_dump() if hasattr(m, "model_dump") else (m if isinstance(m, dict) else dict(m))
         if it.get("question") is not None or it.get("answer") is not None:
             answer = (it.get("answer") or "").strip()
-            if not answer:
-                continue  # 未回答的当前消息，跳过
             question = (it.get("question") or "").strip()
             if question:
                 lines.append(f"用户: {question}")
-            lines.append(f"助手: {answer}")
+            if answer:
+                lines.append(f"助手: {answer}")
         else:
             role = "用户" if it.get("role") == "user" else "助手"
             lines.append(f"{role}: {it.get('content', '')}")

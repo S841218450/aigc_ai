@@ -58,7 +58,7 @@ class KnowledgeBaseDocMetadataService:
     def _ensure_init(self):
         if self._collection is not None:
             return
-        self._client = MongoClient(settings.mongodb_url)
+        self._client = MongoClient(settings.mongodb_url, **settings.mongodb_conn_kwargs)
         db = self._client[settings.mongodb_db_name]
         self._collection = db["kb_documents"]
 
@@ -317,3 +317,15 @@ async def update_chat(id: str, answer: str, status: int = 1, errorMsg: str = "")
         "errorMsg": errorMsg,
     }
     return await API.put("/api/ai/chat/update", body)
+
+# 获取滚动窗口消息
+async def get_chat_window(sessionId: str, ) -> dict:
+    """获取滚动窗口窗口消息（success: true-完成 false-失败）。"""
+    if not sessionId:
+        return {"code": 400, "msg": "sessionId 为空", "data": None, "success": False}
+    body: Dict[str, Any] = {
+        "id": sessionId,
+        "pageNum": 1,
+        "pageSize": 10,#只获取十条消息
+    }
+    return await API.get("/api/ai/message/page", body)

@@ -41,6 +41,7 @@ class KnowledgeBaseQueryRequest(BaseModel):
     question: str
     threadId: Optional[str] = None
     userId: Optional[str] = None
+    messageId: Optional[str] = None  # 当前消息 ID（Java 端创建消息记录后传入，供 Agent 日志关联/回写定位）
     chat_history: Optional[List[KnowledgeBaseChatHistoryItem]] = None # 滑动窗口
     attachments: Optional[List[KnowledgeBaseAttachment]] = None  # 本次提问携带的附件（图片/文档）
     params: Optional[Dict[str, Any]] = {} # 其他参数
@@ -174,3 +175,32 @@ class DocumentListResponse(BaseModel):
     total: int = 0
     page: int = 1
     page_size: int = 50
+
+
+# ======================================================================
+# 记忆同步回调（Java 端删除会话/消息时回调 Agent 清理本地记忆缓存）
+# ======================================================================
+
+class MemoryClearRequest(BaseModel):
+    """删除整个会话时回调：清空 Agent 本地该会话的全部记忆缓存"""
+    threadId: str = Field(..., description="会话 ID（Java 端 sessionId）")
+
+
+class MemoryDeleteMessagesRequest(BaseModel):
+    """删除某段消息时回调：从 Agent 本地日志删除对应消息（含其后的回答）"""
+    threadId: str = Field(..., description="会话 ID（Java 端 sessionId）")
+    messageIds: List[str] = Field(..., description="被删除的用户消息 ID 列表")
+
+
+class MemoryTitleRequest(BaseModel):
+    """新建会话时回调：Agent 异步生成会话标题并回调 Java 保存"""
+    threadId: str = Field(..., description="会话 ID（Java 端 sessionId）")
+    question: str = Field(..., description="该会话第一条用户消息（标题提炼素材）")
+
+
+class MemoryDeleteMessagesResponse(BaseModel):
+    success: bool = False
+    threadId: str = ""
+    matched: int = 0  # 实际匹配删除的消息数（Java 可对账）
+    summary_reset: bool = False  # 是否因删到已总结区间而作废摘要（下次滚动重建）
+    message: str = ""

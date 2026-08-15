@@ -3,7 +3,7 @@ from fastapi import APIRouter, Request
 from app.models.schemas.common import Result
 from app.models.schemas.image_to_image import ImageToImageRequest, ImageToImageRetryRequest
 from app.services.event_store import event_store
-from app.services.node_status import IMAGE_TO_IMAGE_NODE_MAP, build_node_data
+from app.services.node_status import NODE_MAP, build_node_data
 from app.services.sse_service import (
     SSEService,
     build_sse_response,
@@ -16,16 +16,6 @@ from app.workflows.image_to_image.graph import ImageToImageGraph
 router = APIRouter()
 
 
-def _build_node_data(node_name: str, state_update: dict) -> dict:
-    """image_to_image 专用：图片 URL 从 image_list 字段提取（文生图用的是 image_url）"""
-    node_info = IMAGE_TO_IMAGE_NODE_MAP.get(node_name)
-    if node_info and node_info.get("data_key") == "url":
-        raw = state_update.get("image_list")
-        urls = [u for u in raw if u] if isinstance(raw, list) else ([raw] if raw else [])
-        return {"url": urls}
-    return build_node_data(node_name, state_update, node_map=IMAGE_TO_IMAGE_NODE_MAP)
-
-
 async def _create_sse_response(threadId, stream, last_event_id=None):
     """通用 SSE 响应构建：断点续传 + 流式输出"""
     sse = SSEService(thread_id=threadId, event_store=event_store)
@@ -36,8 +26,8 @@ async def _create_sse_response(threadId, stream, last_event_id=None):
                 yield chunk
         async for chunk in sse.stream(graph_to_sse_events(
             stream, sse, threadId,
-            node_map=IMAGE_TO_IMAGE_NODE_MAP,
-            build_node_data=_build_node_data,
+            node_map=NODE_MAP,
+            build_node_data=build_node_data,
         )):
             yield chunk
 
@@ -62,6 +52,7 @@ async def generate_image(request: ImageToImageRequest, req: Request):
         threadId=threadId,
         params=request.params or {},
         originImageList=[item.model_dump() for item in (request.originImageList or [])],
+        model=request.model or "default",
     )
 
     return await _create_sse_response(threadId, stream, last_seq_id)

@@ -1,50 +1,23 @@
 
 from typing import Any, AsyncGenerator, Optional
-import asyncio
 import uuid
 from langgraph.graph import StateGraph, END
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
-from app.workflows.text_to_image.state import TextToImageState
-from app.workflows.text_to_image.nodes import (
-    generate_image_node,
-    desc_code_judge_node,
-    decision_router,
-    supplementary_node,
-    summer_node, prompt_combined_node, human_interrupt_node
-)
-from app.services.checkpointer import checkpointer_service
 from app.core.middleware import WorkflowStatusMiddleware
-from app.tools.image_generation.work_status import change_work_status
-from app.utils.logger_handle import logger
-
-
-async def _safe_change_status(threadId: str, status: str, data: Any = None) -> None:
-    """graph 执行层按序推送业务状态：await 保证顺序，避免 fire-and-forget 乱序改写终态。
-
-    change_work_status 内部已吞掉 HTTP 异常，这里是兜底；失败只记日志，不影响主流程。
-    """
-    try:
-        await change_work_status(threadId, status, data)
-    except Exception as e:
-        logger.warning("状态推送失败 threadId=%s status=%s err=%s", threadId, status, e)
-
-
-def _infer_work_status(node_name: str, state_update: Any) -> tuple[Optional[str], Any]:
-    """节点事件 → 业务状态推断，返回 (status, payload)；status 为 None 表示保持当前状态。
-
-    - selectList 选择题 → pending（等待用户补充描述，payload 带选择题）
-    - summer_node（评估完即流程结束，已取消重绘回流）→ completed
-    - 其他节点 → None：不刷屏 generating，保持当前状态即可
-    """
-    if not isinstance(state_update, dict):
-        return None, None
-    if state_update.get("selectList") not in (None, []):
-        return "pending", state_update.get("selectList")
-    if node_name == "summer_node":
-        return "completed", None
-    return None, None
+from app.services.checkpointer import checkpointer_service
+from app.workflows.common.retry import MAX_MANUAL_RETRIES, retry_node, with_auto_retry
+from app.workflows.common.status import infer_work_status, safe_change_status
+from app.workflows.text_to_image.nodes import (
+    decision_node,
+    generate_node,
+    input_check_node,
+    interrupt_node,
+    prompt_optimize_node,
+    supplementary_node,
+)
+from app.workflows.text_to_image.state import TextToImageState
 
 
 class TextToImageGraph:
@@ -54,53 +27,59 @@ class TextToImageGraph:
     def _build_graph(self) -> CompiledStateGraph:
         workflow = StateGraph(TextToImageState)
 
-        # 1. 注册全部节点
-        workflow.add_node("desc_code_judge_node", desc_code_judge_node) #描述判断节点
-        workflow.add_node("decision_router", decision_router) #决策节点
-        workflow.add_node("supplementary_node", supplementary_node) #补充描述节点
-        workflow.add_node("summer_node", summer_node) #总结节点
-        workflow.add_node("generate_image_node", generate_image_node) #生图节点
-        workflow.add_node("human_interrupt_node", human_interrupt_node) #用户中断节点
-        workflow.add_node("prompt_combined_node", prompt_combined_node) #提示词合并节点
+        # 注册全部节点（统一包一层自动重试：节点抛异常先自动重试，仍失败进入手动重试；
+        # 中断类节点 interrupt_node / retry_node 不能包，interrupt() 需要透传给 LangGraph 运行时）
+        workflow.add_node("input_check_node", with_auto_retry(input_check_node))  # 输入检查
+        workflow.add_node("decision_node", with_auto_retry(decision_node))  # 方案决策
+        workflow.add_node("supplementary_node", with_auto_retry(supplementary_node))  # 补充描述
+        workflow.add_node("interrupt_node", interrupt_node)  # 补充描述中断门
+        workflow.add_node("prompt_optimize_node", with_auto_retry(prompt_optimize_node))  # 提示词优化
+        workflow.add_node("generate_node", with_auto_retry(generate_node))  # 生图
+        workflow.add_node("retry_node", retry_node)  # 手动重试中断门
 
-        workflow.set_entry_point("desc_code_judge_node")
-        workflow.add_edge("desc_code_judge_node", "decision_router")
+        # 每个节点后接条件路由：有 node_error 就进重试中断门，否则走下一个节点
+        def make_route(next_node: str):
+            def route(state: TextToImageState):
+                if state.get("node_error"):
+                    return "retry_node"
+                return next_node
+            return route
 
-        # 2. 决策节点条件分支
+        # 决策路由：描述不通过则进入补充描述流程（文生图特有的提示词补充决策流程）
         def route_decision(state: TextToImageState):
-            is_pass = state.get("isPass", False)
-            if is_pass:
-                return "generate_image_node"
+            if state.get("node_error"):
+                return "retry_node"
+            if state.get("isPass", False):
+                return "generate_node"
             return "supplementary_node"
 
-        workflow.add_conditional_edges("decision_router", route_decision)
-
-
-        workflow.add_edge("supplementary_node", "human_interrupt_node")
-        # 3. 补充描述后，合并提示词再进入生图节点
+        # 补充中断恢复路由：用户已选择或循环超限则放行，否则重新生成选择题
         def route_interrupt(state: TextToImageState):
             selectResult = state.get("selectResult", None)
             # P1#4 防御：记录 supplementary 被触发次数，超过 3 次自动放行（防止用户一直传 None）
             loop_count = state.get("supplementary_loop_count", 0)
             if selectResult is not None or loop_count >= 3:
-                return "prompt_combined_node"
+                return "prompt_optimize_node"
             return "supplementary_node"
-        workflow.add_conditional_edges("human_interrupt_node", route_interrupt)
 
+        # 手动重试路由：回到失败的节点；无目标或超过重试上限则终止（防死循环）
+        def route_retry(state: TextToImageState):
+            retry_target = state.get("retry_target")
+            retry_count = state.get("retry_count", 0) or 0
+            if not retry_target or retry_count >= MAX_MANUAL_RETRIES:
+                return END
+            return retry_target
 
-        workflow.add_edge("prompt_combined_node", "generate_image_node")
-        # 4. 生图后判断：有图→进入总结评估，无图（生图失败/空返回）→直接结束
-        def route_after_generate(state: TextToImageState):
-            if state.get("image_url"):
-                return "summer_node"
-            return END
+        workflow.set_entry_point("input_check_node")
+        workflow.add_conditional_edges("input_check_node", make_route("decision_node"))
+        workflow.add_conditional_edges("decision_node", route_decision)
+        workflow.add_conditional_edges("supplementary_node", make_route("interrupt_node"))
+        workflow.add_conditional_edges("interrupt_node", route_interrupt)
+        workflow.add_conditional_edges("prompt_optimize_node", make_route("generate_node"))
+        workflow.add_conditional_edges("generate_node", make_route(END))
+        workflow.add_conditional_edges("retry_node", route_retry)
 
-        workflow.add_conditional_edges("generate_image_node", route_after_generate)
-
-        # 5. 总结节点：只评估图片质量并返回修改建议，不再回流重绘（已取消重绘机制）
-        workflow.add_edge("summer_node", END)
-
-        # 7. 编译图 (MongoDB 持久化 checkpointer)
+        # 编译图 (MongoDB 持久化 checkpointer，手动重试依赖它恢复中断)
         checkpointer = checkpointer_service.get_checkpointer()
         return workflow.compile(checkpointer=checkpointer)
 
@@ -110,7 +89,7 @@ class TextToImageGraph:
             "user_id": userId,
         }}
 
-    def _make_initial_state(self, question, userId, threadId,model, params) -> TextToImageState:
+    def _make_initial_state(self, question, userId, threadId, model, params) -> TextToImageState:
         """初始化初始状态"""
         return TextToImageState(
             question=question.strip(),
@@ -129,18 +108,13 @@ class TextToImageGraph:
             isPass=None,
             decide_result=None,
             selectList=None,
-            image_url=None,
-            raw_image_urls=None,
+            image_list=None,
             metadata=None,
-            upload_retried=None,
             supplementary_loop_count=0,
-            redraw_count=0,
-            need_redraw=None,
-            match_score=None,
-            image_problem=None,
-            modify_suggest=None,
-            judge_note=None,
-            answer=''
+            answer='',
+            node_error=None,
+            retry_target=None,
+            retry_count=0,
         )
 
     # ---- 流式（SSE 用） ----
@@ -149,15 +123,16 @@ class TextToImageGraph:
         """流式执行：每完成一个节点 yield 一次 (node_name, state_snapshot)。
 
         业务状态统一在 graph 执行层显式推送（中间件不再散弹调用 change_work_status）：
-        开始 → generating；pending/completed 由节点事件推断；正常结束 → completed；异常 → failed。
+        开始 → generating；节点失败/中断 → failed；generate_node（最后节点）→ completed；异常 → failed。
         """
         initial_state = self._make_initial_state(question, userId, threadId, model, params)
         threadId = initial_state["threadId"]
         config = self._make_config(initial_state.get("userId"), threadId)
         try:
             status_mw = WorkflowStatusMiddleware(threadId=threadId)
-            await _safe_change_status(threadId, "generating")
+            await safe_change_status(threadId, "generating")
             last_status = None
+            last_node = None
             async for event in status_mw.wrap_astream(
                 self.graph.astream(initial_state, config, stream_mode=["updates", "custom"]),
             ):
@@ -167,23 +142,26 @@ class TextToImageGraph:
                 else:
                     mode, chunk = "updates", event
                 if mode == "custom":
+                    payload = chunk if isinstance(chunk, dict) else {}
+                    last_node = payload.get("node") or last_node
                     yield "node_start", chunk
                     continue
                 for node_name, state_update in chunk.items():
+                    last_node = node_name
                     yield node_name, state_update
-                    status, payload = _infer_work_status(node_name, state_update)
+                    status, payload = infer_work_status(node_name, state_update, final_node="generate_node")
                     if status:
                         last_status = status
-                        await _safe_change_status(threadId, status, payload)
-            # 流正常走完：未出现 pending/failed 等终态才算真正完成
+                        await safe_change_status(threadId, status, payload)
+            # 流正常走完：未出现 failed/pending 等终态才算真正完成
             if last_status in (None, "generating"):
-                await _safe_change_status(threadId, "completed")
+                await safe_change_status(threadId, "completed")
         except Exception as e:
             import traceback
             stack = traceback.format_exc()
             print(f"[启动流异常] threadId={threadId}, err={stack}")
-            await _safe_change_status(threadId, "failed")
-            yield "error", {"msg": str(e), "stack": stack}
+            await safe_change_status(threadId, "failed")
+            yield "error", {"failed_node": last_node}
 
     async def human_back_stream(self, user_select, userId, threadId) -> AsyncGenerator:
         """流式恢复执行 Command 标准方案（含 P1#4 supplementary 循环计数）"""
@@ -191,10 +169,10 @@ class TextToImageGraph:
 
         snapshot = await self.graph.aget_state(config)
         if not snapshot.values:
-            yield "error", {"msg": f"线程{threadId}不存在，请先发起生成流程"}
+            yield "error", {"failed_node": None}
             return
 
-        # P1#4：记录 supplementary 循环计数（human_interrupt 恢复时累加一次）
+        # P1#4：记录 supplementary 循环计数（interrupt_node 恢复时累加一次）
         current_values = dict(snapshot.values)
         prev_loop = current_values.get("supplementary_loop_count", 0) or 0
         update_state = {"supplementary_loop_count": prev_loop + 1}
@@ -203,8 +181,9 @@ class TextToImageGraph:
             # 先把计数器写回 checkpoint，再 resume
             await self.graph.aupdate_state(config, update_state)
             status_mw = WorkflowStatusMiddleware(threadId=threadId)
-            await _safe_change_status(threadId, "generating")
+            await safe_change_status(threadId, "generating")
             last_status = None
+            last_node = None
             async for event in status_mw.wrap_astream(
                 self.graph.astream(Command(resume=user_select), config, stream_mode=["updates", "custom"]),
             ):
@@ -213,58 +192,64 @@ class TextToImageGraph:
                 else:
                     mode, chunk = "updates", event
                 if mode == "custom":
+                    payload = chunk if isinstance(chunk, dict) else {}
+                    last_node = payload.get("node") or last_node
                     yield "node_start", chunk
                     continue
                 for node_name, state_update in chunk.items():
+                    last_node = node_name
                     yield node_name, state_update
-                    status, payload = _infer_work_status(node_name, state_update)
+                    status, payload = infer_work_status(node_name, state_update, final_node="generate_node")
                     if status:
                         last_status = status
-                        await _safe_change_status(threadId, status, payload)
+                        await safe_change_status(threadId, status, payload)
             if last_status in (None, "generating"):
-                await _safe_change_status(threadId, "completed")
+                await safe_change_status(threadId, "completed")
         except Exception as e:
             import traceback
             stack = traceback.format_exc()
             print(f"[人工恢复流异常] threadId={threadId}, err={stack}")
-            await _safe_change_status(threadId, "failed")
-            yield "error", {"msg": str(e), "stack": stack}
+            await safe_change_status(threadId, "failed")
+            yield "error", {"failed_node": last_node}
 
     async def retry_stream(self, userId, threadId) -> AsyncGenerator:
-        """出错后重试执行：从最后一次成功的 checkpoint 继续，重新执行出错节点 - SSE"""
+        """手动重试：用 Command(resume=True) 唤醒 retry_node 的中断，回到失败节点继续执行 - SSE"""
         config = self._make_config(userId, threadId)
 
         snapshot = await self.graph.aget_state(config)
         if not snapshot.values:
-            yield "error", {"msg": f"线程{threadId}不存在，请先发起生成流程"}
+            yield "error", {"failed_node": None}
             return
 
         try:
             status_mw = WorkflowStatusMiddleware(threadId=threadId)
-            await _safe_change_status(threadId, "generating")
+            await safe_change_status(threadId, "generating")
             last_status = None
-            # astream(None) 从 checkpoint 继续，出错节点会重新执行
+            last_node = None
             async for event in status_mw.wrap_astream(
-                self.graph.astream(None, config, stream_mode=["updates", "custom"]),
+                self.graph.astream(Command(resume=True), config, stream_mode=["updates", "custom"]),
             ):
                 if isinstance(event, tuple):
                     mode, chunk = event
                 else:
                     mode, chunk = "updates", event
                 if mode == "custom":
+                    payload = chunk if isinstance(chunk, dict) else {}
+                    last_node = payload.get("node") or last_node
                     yield "node_start", chunk
                     continue
                 for node_name, state_update in chunk.items():
+                    last_node = node_name
                     yield node_name, state_update
-                    status, payload = _infer_work_status(node_name, state_update)
+                    status, payload = infer_work_status(node_name, state_update, final_node="generate_node")
                     if status:
                         last_status = status
-                        await _safe_change_status(threadId, status, payload)
+                        await safe_change_status(threadId, status, payload)
             if last_status in (None, "generating"):
-                await _safe_change_status(threadId, "completed")
+                await safe_change_status(threadId, "completed")
         except Exception as e:
             import traceback
             stack = traceback.format_exc()
             print(f"[重试流异常] threadId={threadId}, err={stack}")
-            await _safe_change_status(threadId, "failed")
-            yield "error", {"msg": str(e), "stack": stack}
+            await safe_change_status(threadId, "failed")
+            yield "error", {"failed_node": last_node}

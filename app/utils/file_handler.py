@@ -5,7 +5,7 @@ import re
 import zipfile
 
 
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from app.utils.logger_handle import logger
 
@@ -439,5 +439,23 @@ def docx_loader(
 def pdf_loader(file_path:str, passwd:None)->list[Document]:
     return PyPDFLoader(file_path, passwd).load()
 
+
+# 纯文本文件常见编码探测顺序（utf-8-sig 兼容 BOM；中文 txt 多为 GBK/GB18030）
+_TXT_ENCODINGS = ["utf-8-sig", "utf-8", "gbk", "gb18030", "utf-16", "big5", "latin-1"]
+
+
 def txt_loader(file_path:str)->list[Document]:
-    return TextLoader(file_path).load()
+    """读取纯文本文件（自动探测编码，避免中文 GBK 等编码的 txt 因默认 utf-8 解码失败）。"""
+    with open(file_path, "rb") as f:
+        raw = f.read()
+    text = None
+    for enc in _TXT_ENCODINGS:
+        try:
+            text = raw.decode(enc)
+            break
+        except (UnicodeDecodeError, LookupError):
+            continue
+    if text is None:
+        # 终极兜底：utf-8 + errors=replace，保证不抛异常
+        text = raw.decode("utf-8", errors="replace")
+    return [Document(page_content=text)]

@@ -25,10 +25,19 @@ from app.models.schemas.knowledge_base import (
     StopGenerationRequest,
     RetryRequest,
     ControlResponse,
+    MemoryClearRequest,
+    MemoryDeleteMessagesRequest,
+    MemoryDeleteMessagesResponse,
+    MemoryTitleRequest,
 )
 from app.services.chat_memory import chat_memory
 from app.services.event_store import event_store
-from app.services.knowledge_base_chat_service import run_query_stream
+from app.services.knowledge_base_chat_service import (
+    clear_session_memory,
+    delete_session_messages,
+    run_query_stream,
+    spawn_title_task,
+)
 from app.services.knowledge_base_doc_service import (
     submit_ingest_document,
     delete_document,
@@ -85,7 +94,11 @@ async def query_knowledge_base(request: KnowledgeBaseQueryRequest, req: Request)
     message_history = None
     if request.chat_history:
         message_history = parse_chat_history(request.chat_history)
-    message_id = request.threadId or ""
+        # 去重：Java 会把当前进行中消息（question 与当前问题相同、answer 为空）放进
+        # chat_history，parse 后已保留其 user 消息，这里剔除，避免与 query 重复注入
+        if message_history and message_history[-1]["role"] == "user" and message_history[-1]["content"] == request.question:
+            message_history.pop()
+    message_id = request.messageId or request.threadId or ""  # 优先新字段 messageId；兼容旧约定回退 threadId
 
     sse, wrapped = await run_query_stream(
         thread_id, request.question, params,
@@ -243,4 +256,58 @@ async def query_documents(
         keyword=keyword,
         page=page,
         page_size=page_size,
+    )
+
+
+# ----------------------------- 5. 记忆同步（会话/消息删除回调） -----------------------------
+
+@router.post(
+    "/internal/memory/clear",
+    response_model=ControlResponse,
+    dependencies=_internal_router_depends,
+    summary="[内部] 删除会话时回调：清空 Agent 本地该会话全部记忆缓存",
+)
+async def clear_session_memory_ep(payload: MemoryClearRequest):
+    """业务端删除整个会话（含所有消息）后回调，清理 Agent 本地短期窗口/摘要/全量日志，
+    防止已删除内容通过本地缓存回灌上下文。幂等。"""
+    await clear_session_memory(payload.threadId)
+    return ControlResponse(success=True, threadId=payload.threadId, message="会话记忆缓存已清理")
+
+
+@router.post(
+    "/internal/memory/messages/delete",
+    response_model=MemoryDeleteMessagesResponse,
+    dependencies=_internal_router_depends,
+    summary="[内部] 删除某段消息时回调：从 Agent 本地日志删除对应消息（含其后的回答）",
+)
+async def delete_session_messages_ep(payload: MemoryDeleteMessagesRequest):
+    """业务端删除一段对话（用户消息 + 其回答）后回调，同步清理 Agent 本地日志。
+    若被删消息已进入摘要，摘要作废并于下次请求时基于剩余日志重建。"""
+    result = await delete_session_messages(payload.threadId, payload.messageIds)
+    return MemoryDeleteMessagesResponse(
+        success=True,
+        threadId=payload.threadId,
+        matched=result["matched"],
+        summary_reset=result["summary_reset"],
+        message=f"已匹配删除 {result['matched']} 条消息",
+    )
+
+
+@router.post(
+    "/internal/memory/title",
+    response_model=ControlResponse,
+    dependencies=_internal_router_depends,
+    summary="[内部] 新建会话时回调：异步生成会话标题并回调 Java 保存",
+)
+async def generate_title_ep(payload: MemoryTitleRequest):
+    """Java 新建会话时携带第一条消息调用本接口。
+
+    标题生成是异步的（LLM 提炼 → 回调 Java 保存），本接口**立即返回成功**，
+    不阻塞用户的第一条对话；生成/保存失败仅记日志，不影响会话。
+    """
+    spawn_title_task(payload.threadId, payload.question)
+    return ControlResponse(
+        success=True,
+        threadId=payload.threadId,
+        message="标题生成任务已受理（异步执行）",
     )

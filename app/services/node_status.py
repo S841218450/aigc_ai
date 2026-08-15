@@ -1,56 +1,73 @@
 """
 节点状态映射 + 类型驱动的 data 返回
+
+文生图 / 图生图共用同一份 NODE_MAP（节点名已统一，前端只认这一套）：
 每个节点定义 data_key 决定 SSE data 的格式：
   - "messages"   → {"messages": "str"}     执行摘要
   - "selectList"  → {"selectList": [...]}   人工介入选择题
-  - "url"         → {"url": "str"}          生成的图片 URL
+  - "image_list"  → {"url": [...], "imageList": [...]}  生成图片 URL（无论单张/多张统一数组）
   - "answer"      → {"answer": "str"}       最终答案
   - "sources"     → {"sources": [...]}      来源文档列表
   - "confidence"  → {"confidence": {...}}   置信度信息
 """
 
-TEXT_TO_IMAGE_NODE_MAP = {
-    "desc_code_judge_node": {
-        "type": "step_judge",
-        "status": "正在评估用户描述",
+# ---- 文生图 / 图生图统一节点映射 ----
+# name 为中文步骤名，供前端展示与错误提示，绝不透出原始节点名
+NODE_MAP = {
+    "input_check_node": {
+        "type": "step_input_check",
+        "status": "正在检查描述与图像参数",
+        "name": "输入检查",
         "data_key": "messages",
     },
-    "decision_router": {
+    "decision_node": {
         "type": "step_decision",
-        "status": "正在进行下一步决策",
+        "status": "正在判断是否需要补充描述",
+        "name": "方案决策",
         "data_key": "messages",
     },
     "supplementary_node": {
         "type": "step_supplementary",
-        "status": "正在生成补充选择题",
+        "status": "正在生成补充描述选项",
+        "name": "补充描述",
         "data_key": "selectList",
     },
-    "human_interrupt_node": {
+    "interrupt_node": {
         "type": "step_interrupt",
-        "status": "等待用户补充描述",
+        "status": "请补充描述信息以生成更符合要求的图片",
+        "name": "补充描述",
         "data_key": "messages",
     },
-    "prompt_combined_node": {
-        "type": "step_prompt_combined",
+    "prompt_optimize_node": {
+        "type": "step_prompt_optimize",
         "status": "正在优化绘图提示词",
+        "name": "提示词优化",
         "data_key": "messages",
     },
-    "generate_image_node": {
+    "generate_node": {
         "type": "step_generate",
-        "status": "生成图片中",
-        "data_key": "url",
+        "status": "正在生成图片",
+        "name": "图片生成",
+        "data_key": "image_list",
     },
-    "summer_node": {
-        "type": "step_summary",
-        "status": "正在评估生成结果",
+    "retry_node": {
+        "type": "step_retry",
+        "status": "步骤执行失败，等待重试",
+        "name": "重试",
         "data_key": "messages",
     },
 }
 
 
+def get_step_name(node_name: str, node_map: dict = None) -> str:
+    """节点名 → 中文步骤名（供错误提示使用，不暴露原始节点名）"""
+    info = (node_map or NODE_MAP).get(node_name)
+    return (info or {}).get("name") or ""
+
+
 def build_node_data(node_name: str, state_update: dict, node_map: dict = None) -> dict:
     """根据节点类型提取 data，返回统一格式。支持传入自定义 node_map"""
-    _map = node_map or TEXT_TO_IMAGE_NODE_MAP
+    _map = node_map or NODE_MAP
     node_info = _map.get(node_name)
     if not node_info:
         return {"messages": state_update.get("agent_log", state_update.get("answer", ""))}
@@ -61,17 +78,12 @@ def build_node_data(node_name: str, state_update: dict, node_map: dict = None) -
         return {"messages": state_update.get("agent_log", state_update.get("answer", ""))}
     elif data_key == "selectList":
         return {"selectList": state_update.get("selectList", [])}
-    elif data_key in ("image_url", "url", "image_list"):
-        # 图片节点统一：文生图 state 字段是 image_url，图生图是 image_list
-        field = "image_url" if data_key != "image_list" else "image_list"
-        raw_url = state_update.get(field)
-        if isinstance(raw_url, list):
-            urls = [u for u in raw_url if u]
-        else:
-            urls = [raw_url] if raw_url else []
+    elif data_key == "image_list":
+        # 图片统一数组：无论单张还是多张
+        raw = state_update.get("image_list")
+        urls = [u for u in raw if u] if isinstance(raw, list) else ([raw] if raw else [])
         return {
             "messages": state_update.get("agent_log", ""),
-            "url": urls,  # 兼容旧前端
             "imageList": [{"id": "", "url": u} for u in urls],  # 统一图片数组格式
         }
     elif data_key == "answer":
@@ -97,23 +109,28 @@ def build_node_data(node_name: str, state_update: dict, node_map: dict = None) -
         return {"messages": state_update.get("agent_log", state_update.get("answer", ""))}
 
 
-# ---- 各场景节点映射 ----
+# ---- 知识库场景节点映射（独立场景，不使用统一 NODE_MAP） ----
 
 KNOWLEDGE_BASE_NODE_MAP = {
     "intent_recognition": {
         "type": "step_intent",
-        "status": "正在识别查询意图",
+        "status": "正在识别用户意图",
         "data_key": "messages",
     },
-    "structured_query_node": {
-        "type": "step_structured_query",
-        "status": "正在检索知识库文档",
+    "retrieval_agent": {
+        "type": "step_retrieval",
+        "status": "正在检索知识库",
+        "data_key": "messages",
+    },
+    "answer": {
+        "type": "step_answer",
+        "status": "正在生成回答",
         "data_key": "messages",
     },
     "chat_answer": {
         "type": "step_chat",
-        "status": "正在回复（无需检索知识库）",
-        "data_key": "answer",
+        "status": "正在回复",
+        "data_key": "messages",
     },
     "query_understanding": {
         "type": "step_query_understanding",
@@ -158,7 +175,7 @@ KNOWLEDGE_BASE_NODE_MAP = {
     "generate_answer": {
         "type": "step_generate",
         "status": "正在生成答案",
-        "data_key": "answer",
+        "data_key": "messages",
     },
     "confidence_evaluation": {
         "type": "step_confidence",
@@ -169,40 +186,5 @@ KNOWLEDGE_BASE_NODE_MAP = {
         "type": "step_format",
         "status": "正在整理最终结果",
         "data_key": "sources",
-    },
-}
-
-TEXT_TO_VIDEO_NODE_MAP = {}
-
-IMAGE_TO_IMAGE_NODE_MAP = {
-    "params_filter_node": {
-        "type": "step_filter",
-        "status": "正在过滤敏感词与图像参数",
-        "data_key": "messages",
-    },
-    "prompt_optimization_node": {
-        "type": "step_prompt_optimize",
-        "status": "正在优化绘图提示词",
-        "data_key": "messages",
-    },
-    "generate_image_node": {
-        "type": "step_generate",
-        "status": "正在生成图片",
-        "data_key": "image_list",
-    },
-    "quality_evaluation_node": {
-        "type": "step_quality",
-        "status": "正在评估生成质量",
-        "data_key": "messages",
-    },
-    "summary_node": {
-        "type": "step_summary",
-        "status": "正在整理结果",
-        "data_key": "answer",
-    },
-    "await_retry_node": {
-        "type": "step_retry",
-        "status": "节点执行失败，等待重试",
-        "data_key": "messages",
     },
 }

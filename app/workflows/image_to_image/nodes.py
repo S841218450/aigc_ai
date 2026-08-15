@@ -1,74 +1,20 @@
-import asyncio
-import functools
 import logging
 import re
-from typing import List, Optional
 
-from langgraph.types import interrupt
+from langgraph.types import StreamWriter
 from pydantic import BaseModel, Field
 
 from app.core.agents.model_factory import get_model, get_image_client
 from app.core.prompts.prompts_factory import get_prompt
-from app.tools.image_generation.work_status import upload_file_by_url, update_work_image
-from app.utils.image_utils import SIZE_MAP
+from app.tools.image_generation.work_status import update_work_image
+from app.tools.image_generation.generate import generate_images_and_save, resolve_image_model_name
 from app.workflows.common.common_node import clean_return, structured_output_invoke
 from app.workflows.image_to_image.state import ImageToImageState
 
 logger = logging.getLogger(__name__)
 
-# ---------------- 节点重试机制 ----------------
 
-MAX_AUTO_RETRIES = 2     # 节点自动重试次数（指数退避）
-MAX_MANUAL_RETRIES = 3   # 手动重试总轮数上限（防死循环）
-
-
-def with_auto_retry(node_fn, max_retries: int = MAX_AUTO_RETRIES, base_delay: float = 1.0):
-    """节点自动重试装饰器：节点抛异常时自动重试，仍失败则写入 node_error/retry_target，
-    由图路由到 await_retry_node 等待用户手动重试（/retry 端点用 Command(resume=True) 恢复）。
-    """
-    @functools.wraps(node_fn)
-    async def wrapper(state):
-        last_error = None
-        for attempt in range(max_retries + 1):
-            try:
-                result = await node_fn(state)
-                if result is None:
-                    result = {}
-                # 成功后清除上次失败标记，让路由走正常后续节点
-                result["node_error"] = None
-                result["retry_target"] = None
-                return result
-            except Exception as e:
-                last_error = e
-                logger.warning("[%s] 第 %s 次执行失败: %s", node_fn.__name__, attempt + 1, e)
-                if attempt < max_retries:
-                    await asyncio.sleep(base_delay * (2 ** attempt))
-        return clean_return({
-            "agent_log": f"{node_fn.__name__} 执行失败（自动重试 {max_retries} 次仍未成功），等待手动重试",
-            "node_error": str(last_error),
-            "retry_target": node_fn.__name__,
-        })
-
-    return wrapper
-
-
-async def await_retry_node(state: ImageToImageState):
-    """手动重试中断门：节点失败后暂停，等用户触发重试后回到失败节点继续执行。"""
-    retry_count = (state.get("retry_count") or 0) + 1
-    interrupt({
-        "title": "节点执行失败，等待重试",
-        "message": f"节点「{state.get('retry_target')}」执行失败，点击「重试」后将从该节点继续执行",
-        "retry_target": state.get("retry_target"),
-        "retry_count": retry_count,
-        "node_error": state.get("node_error"),
-    })
-    return clean_return({
-        "agent_log": f"用户触发第 {retry_count} 轮手动重试，回到节点「{state.get('retry_target')}」",
-        "retry_count": retry_count,
-    })
-
-
-# ---------------- 1. 参数过滤节点 ----------------
+# ---------------- 1. 输入检查节点 ----------------
 
 class ParamsFilterOutput(BaseModel):
     prompt: str = Field(description="去除敏感词与图像参数词后的纯净提示词")
@@ -80,11 +26,11 @@ def _regex_filter_prompt(text: str) -> str:
         re.IGNORECASE,
     )
     return _PARAM_WORD_PATTERN.sub(" ", text or "").strip()
-async def params_filter_node(state: ImageToImageState):
-    """参数过滤节点：剔除敏感词 + 图像参数词。
+async def input_check_node(state: ImageToImageState):
+    """输入检查节点：剔除敏感词 + 图像参数词。
 
     图像参数（尺寸/张数/参考强度）由 params 决定，必须在提示词里剔除，
-    否则会和 generate_image_node 的 extra_body 参数冲突。
+    否则会和 generate_node 的 extra_body 参数冲突。
     """
     llm = get_model("summarizer")
     base_prompt = get_prompt("image_to_image", "params_filter")
@@ -116,7 +62,7 @@ class PromptOptimizationOutput(BaseModel):
     prompt: str = Field(description="优化后的高质量绘图提示词")
 
 
-async def prompt_optimization_node(state: ImageToImageState):
+async def prompt_optimize_node(state: ImageToImageState):
     """提示词优化节点：把过滤后的提示词扩写为 AI 绘图模型听得懂的高质量提示词。"""
     llm = get_model("summarizer")
     base_prompt = get_prompt("image_to_image", "prompt_optimization")
@@ -146,106 +92,38 @@ async def prompt_optimization_node(state: ImageToImageState):
     })
 
 
-async def generate_image_node(state: ImageToImageState):
-    """图片生成节点：params 决定图像参数，prompt 只负责画面内容。"""
+# ---------------- 3. 生图节点 ----------------
+
+async def generate_node(state: ImageToImageState, writer: StreamWriter = None):
+    """图片生成节点：params 决定图像参数，prompt 只负责画面内容。
+
+    writer 由 LangGraph 在 custom 流式模式下注入，用于模型调用前发出节点开始信号。
+    """
     client = get_image_client()
-    model_name = "doubao-seedream-5-0-260128"
+    model_name = resolve_image_model_name(state.get("model", "default"))
     # 参考图：取第一张（其余仅打日志，避免多图参数格式不确定影响出图）
     origin_images = state.get("originImageList") or []
     logger.info("参考图共收到 %s 张", len(origin_images))
-    
-    reference_url = origin_images[0] if len(origin_images) ==1 else origin_images
+
+    reference_url = origin_images[0] if len(origin_images) == 1 else origin_images
+    # 节点开始信号：模型调用前发出，SSE 先展示"正在生成图片"
+    if writer:
+        writer({"node": "generate_node", "messages": "正在生成图片..."})
     # 生图失败/上传失败都抛异常：交给 with_auto_retry 自动重试，仍失败则走手动重试
     try:
-        response = await client.images.generate(
-            model=model_name,
+        image_urls, count = await generate_images_and_save(
+            client,
+            model_name=model_name,
             prompt=state["prompt"],
-            extra_body={
-                "images": reference_url,
-                "response_format": "url",
-                "watermark": False,#水印
-            },
+            images=reference_url,
+            work_id=state["threadId"],
         )
     except Exception as e:
         logger.error("生图失败: work_id=%s, error=%s", state.get("threadId"), e)
         raise RuntimeError(f"图片生成失败：{e}")
-    res_list = response.data
-    image_urls = [item.url for item in res_list if item.url]
-    logger.info(f"模型{getattr(response, 'model', model_name)}生成了{len(res_list)}张图片")
-    resp = await update_work_image(state["threadId"], dataList=[{"url": u} for u in image_urls])
-    if resp and resp.get("success"):
-        saved_list = ((resp.get("data") or {}).get("dataList")) or []
-        preview_urls = [item.get("url") for item in saved_list if item.get("url")]
-        if preview_urls:
-            image_urls = preview_urls
 
     return clean_return({
-        "agent_log": f"图片生成完成，共 {len(res_list)} 张，正在评估质量...",
+        "agent_log": f"图片生成完成，共 {count} 张",
         "image_list": image_urls,
         "metadata": {},
-    })
-
-
-# ---------------- 4. 质量评估节点 ----------------
-
-class QualityOutput(BaseModel):
-    isPass: bool = Field(description="图片质量是否合格")
-    match_score: int = Field(description="图片与提示词匹配度 0-10")
-    image_problem: str = Field(description="当前图片存在的缺陷问题")
-    modify_suggest: str = Field(description="可直接复用的绘图优化建议")
-
-
-async def quality_evaluation_node(state: ImageToImageState):
-    """生图质量审核与评估：评估生成结果是否合格，仅做记录，不阻塞主流程。"""
-    image_list = state.get("image_list") or []
-    if not image_list:
-        return clean_return({
-            "agent_log": "本次未生成有效图片，跳过质量评估",
-            "isPass": False,
-        })
-
-    llm = get_model("summarizer")
-    base_prompt = get_prompt("image_to_image", "quality_evaluation")
-    prompt = f"""
-        {base_prompt}
-        用户提示词：{state.get("question") or state.get("prompt", "")}
-        生成图片URL：{image_list[0]}
-    """
-    fallback = QualityOutput(
-        isPass=True,
-        match_score=7,
-        image_problem="结构化解析失败，无法判断具体缺陷",
-        modify_suggest="",
-    )
-    result: QualityOutput = await structured_output_invoke(
-        llm, prompt, QualityOutput, fallback,
-    )
-
-    return clean_return({
-        "agent_log": f"图片评估完成，匹配度：{result.match_score}/10，问题：{result.image_problem}",
-        "isPass": result.isPass,
-        "match_score": result.match_score,
-        "image_problem": result.image_problem,
-    })
-
-
-# ---------------- 5. 总结节点 ----------------
-
-async def summary_node(state: ImageToImageState):
-    """总结节点：汇总本次生图结果，返回最终图片列表与说明。"""
-    image_list = state.get("image_list") or []
-    is_pass = state.get("isPass", True)
-    image_problem = state.get("image_problem") or ""
-
-    if image_list:
-        if is_pass:
-            answer = f"已成功生成 {len(image_list)} 张图片。"
-        else:
-            answer = f"已生成 {len(image_list)} 张图片，但质量评估未完全通过：{image_problem}"
-    else:
-        answer = "本次图片生成失败，请检查输入后重试。"
-
-    return clean_return({
-        "agent_log": "图生图流程执行完成",
-        "answer": answer,
     })

@@ -5,14 +5,10 @@ from app.workflows.text_to_image.graph import TextToImageGraph
 from app.services.sse_service import (
     SSEService, graph_to_sse_events, replay_events, build_sse_response, task_manager,
 )
-from app.services.node_status import TEXT_TO_IMAGE_NODE_MAP, build_node_data
+from app.services.node_status import NODE_MAP, build_node_data
 from app.services.event_store import event_store
 
 router = APIRouter()
-
-
-def _build_node_data(node_name: str, state_update: dict) -> dict:
-    return build_node_data(node_name, state_update, node_map=TEXT_TO_IMAGE_NODE_MAP)
 
 
 async def _create_sse_response(threadId, stream, last_event_id=None):
@@ -25,8 +21,8 @@ async def _create_sse_response(threadId, stream, last_event_id=None):
                 yield chunk
         async for chunk in sse.stream(graph_to_sse_events(
             stream, sse, threadId,
-            node_map=TEXT_TO_IMAGE_NODE_MAP,
-            build_node_data=_build_node_data,
+            node_map=NODE_MAP,
+            build_node_data=build_node_data,
         )):
             yield chunk
 

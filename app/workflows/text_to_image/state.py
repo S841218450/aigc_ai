@@ -12,29 +12,24 @@ class TextToImageState(BaseState):
     # ---------------------- Agent 执行日志（每节点追加） ----------------------
     agent_log: Optional[str]  # 节点执行摘要，SSE 回传给前端
 
-    # ---------------------- desc_code_judge_node 打分节点输出 ----------------------
+    # ---------------------- input_check_node 输入检查输出 ----------------------
     totalScope: Optional[int]  # 描述总分 0-70
     need_manual_count: Optional[int] # 薄弱维度数量（决策核心判定参数）
     judgeList: Optional[Dict[str, int]]  # 各维度分项分数明细
     judge_summary: Optional[str] #评分结果
-    # ---------------------- decision_router 决策路由节点输出 ----------------------
+    # ---------------------- decision_node 方案决策输出 ----------------------
     isPass: Optional[bool]  # 是否直接放行生图 True/False
-    decide_result: Optional[str] # 决策判定一句话原因（修复拼写deside→decide）
+    decide_result: Optional[str] # 决策判定一句话原因
 
-    # ---------------------- supplementary_node 选择题补充节点输出 ----------------------
+    # ---------------------- supplementary_node 补充选择题输出 ----------------------
     selectList: Optional[List[Dict[str, Any]]]  # 前端展示的补充选择题列表
     selectResult: Optional[List[Dict[str, str]]] #选择结果
-    supplementary_loop_count: Optional[int]  # human_interrupt → supplementary 循环次数（超过3次自动放行）
-    # ---------------------- generate_image_node 生图节点输出 ----------------------
-    raw_image_urls: Optional[List[str]]  # 原始图片URL，上传失败时可仅重试上传
-    image_url: Optional[List[str]]  # 生成图片地址列表（统一为列表，支持多图）
-    metadata: Optional[Dict[str, Any]]  # SD工具返回图片元数据
-    upload_retried: Optional[int]   # 上传失败重试次数（防止无限循环）
+    supplementary_loop_count: Optional[int]  # interrupt_node → supplementary 循环次数（超过3次自动放行）
+    # ---------------------- generate_node 生图节点输出 ----------------------
+    image_list: Optional[List[str]]  # 生成图片地址列表（统一为数组，支持单张/多张）
+    metadata: Optional[Dict[str, Any]]  # 生图元数据
 
-    # ---------------------- summer_node 总结评估+重绘控制字段 ----------------------
-    redraw_count: int   # 重绘次数，上限2次防止死循环，初始0
-    need_redraw: Optional[bool]  # 是否需要回流重绘 True/False
-    match_score: Optional[int]  # 图片与用户描述匹配度 0-10
-    image_problem: Optional[str]   # 当前图片存在的缺陷
-    modify_suggest: Optional[str]  # 绘图优化修改建议
-    judge_note: Optional[str]   # 重绘判定备注（含次数限制逻辑）
+    # ---------------------- 节点重试机制 ----------------------
+    node_error: Optional[str]     # 最近一次节点执行错误信息（有值说明需要重试）
+    retry_target: Optional[str]   # 需要重试的节点名
+    retry_count: Optional[int]    # 手动重试轮数（防死循环）

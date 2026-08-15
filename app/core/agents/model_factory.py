@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 import os
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -22,6 +22,7 @@ ModelType = Literal[
     'Executor',
     'embedding',
     'intent',
+    'inspiration',
     'Supervisor',
     'generate_image',
     'supplementary',
@@ -29,6 +30,7 @@ ModelType = Literal[
     'Specialist',
     'Reviewer',
     'text_to_image',
+    'kb_answer',
 ]
 
 
@@ -39,7 +41,7 @@ def get_image_client() -> AsyncOpenAI:
         api_key=ARK_API_KEY,
     )
 
-def get_model(role: ModelType):
+def get_model(role: ModelType, config: Optional[dict] = None):
     # 通用大模型基础配置，减少重复代码
     base_chat_cfg = {
         "api_key": QWEN_API_KEY,
@@ -64,6 +66,14 @@ def get_model(role: ModelType):
             max_tokens=2048,
             **base_chat_cfg
         )
+    elif role == "kb_answer":
+        # 知识库回答节点：长回答输出（检索与回答已拆分，回答单独占用输出预算）
+        return ChatOpenAI(
+            model="qwen3.7-max-2026-06-08",
+            temperature=0.3,
+            max_tokens=4096,
+            **base_chat_cfg
+        )
     elif role == "Reviewer":
         # 结果校验
         return ChatOpenAI(
@@ -78,6 +88,14 @@ def get_model(role: ModelType):
             model="qwen3.7-flash-2026-07-15",
             temperature=0.2,
             max_tokens=4096,
+            **base_chat_cfg
+        )
+    elif role == "inspiration":
+        # 每日灵感：高温度保证题材多样性，输出灵感种子
+        return ChatOpenAI(
+            model="qwen3.7-max-preview",
+            temperature=0.9,
+            max_tokens=2048,
             **base_chat_cfg
         )
     elif role == "supplementary":
@@ -97,13 +115,15 @@ def get_model(role: ModelType):
             check_embedding_ctx_length=False,
         )
     elif role in ("summarizer", "prompt_combined"):
-        # 摘要、提示词合并，4096不变
-        return ChatOpenAI(
-            model="qwen3.7-max-preview",
-            temperature=0.5 if role == "summarizer" else 0.2,
-            max_tokens=4096,
-            **base_chat_cfg
-        )
+        # 摘要、提示词合并，4096不变；config 可覆盖默认参数（如 temperature）
+        kwargs = {
+            "model": "qwen3.7-max-preview",
+            "temperature": 0.5 if role == "summarizer" else 0.2,
+            "max_tokens": 4096,
+            **base_chat_cfg,
+            **(config or {}),
+        }
+        return ChatOpenAI(**kwargs)
 
     else:
         # 兜底通用执行节点，从512上调至1024

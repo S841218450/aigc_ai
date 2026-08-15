@@ -35,6 +35,18 @@ class Settings(BaseSettings):
     # MongoDB (LangGraph Checkpointer)
     mongodb_url: str = os.getenv("MONGODB_URL")
     mongodb_db_name: str = os.getenv("MONGODB_DB_NAME")
+    mongodb_account: str = os.getenv("MONGODB_ACCOUNT")
+    mongodb_password: str = os.getenv("MONGODB_PASSWORD")
+
+    @property
+    def mongodb_conn_kwargs(self) -> dict:
+        """MongoClient 连接参数，服务器端 MongoDB 需要账号密码认证时自动带上"""
+        kwargs = {}
+        if self.mongodb_account:
+            kwargs["username"] = self.mongodb_account
+        if self.mongodb_password:
+            kwargs["password"] = self.mongodb_password
+        return kwargs
 
     # Java Backend API
     java_api_base_url: str = os.getenv("JAVA_API_BASE_URL")

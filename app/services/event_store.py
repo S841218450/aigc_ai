@@ -27,7 +27,7 @@ class EventStore:
     def _ensure_init(self):
         if self._collection is not None:
             return
-        self._client = MongoClient(settings.mongodb_url)
+        self._client = MongoClient(settings.mongodb_url, **settings.mongodb_conn_kwargs)
         db = self._client[settings.mongodb_db_name]
         self._collection = db["sse_events"]
 
