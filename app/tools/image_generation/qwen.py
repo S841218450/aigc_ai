@@ -21,6 +21,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _strip_secret(value):
+    """去掉环境变量值首尾的引号（防止部署环境原样注入引号导致 401 invalid_api_key）。"""
+    if not value:
+        return value
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
 logger = logging.getLogger(__name__)
 
 # ---- 端点配置 ----
@@ -33,7 +44,7 @@ QWEN_IMAGE_API_URL = os.getenv(
 # 调用 wan 模型前需在 .env 配置 WAN_IMAGE_BASE_URL，如：
 #   https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
 WAN_IMAGE_API_URL = os.getenv("WAN_IMAGE_BASE_URL", QWEN_IMAGE_API_URL).rstrip("/")
-QWEN_API_KEY = os.getenv("QWEN_API_KEY")
+QWEN_API_KEY = _strip_secret(os.getenv("QWEN_API_KEY"))
 
 # ---- 轮询配置：指数退避（1s → 2s → 4s → 8s → 10s 封顶）----
 POLL_INITIAL_INTERVAL_SEC = 1.0

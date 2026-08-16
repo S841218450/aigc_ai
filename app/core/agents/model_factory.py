@@ -7,8 +7,24 @@ from langchain_ollama import OllamaEmbeddings
 
 load_dotenv()
 
+
+def _strip_secret(value: Optional[str]) -> Optional[str]:
+    """去掉环境变量值首尾的引号。
+
+    部分部署环境（如非 dotenv 的 .env 解析/脚本注入）不会剥掉 .env 里的引号，
+    会把 QWEN_API_KEY='"sk-xxx"' 原样带进环境变量，导致请求携带 Bearer "sk-xxx"
+    被 DashScope 拒绝（401 invalid_api_key）。这里统一兜底。
+    """
+    if not value:
+        return value
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
 # 统一环境常量抽离
-QWEN_API_KEY = os.getenv("QWEN_API_KEY")
+QWEN_API_KEY = _strip_secret(os.getenv("QWEN_API_KEY"))
 QWEN_BASE_URL = os.getenv("QWEN_API_BASE_URL")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
 CLOUDBASE_ACCESS_TOKEN = os.getenv("CLOUDBASE_ACCESS_TOKEN")
