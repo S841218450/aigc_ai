@@ -10,8 +10,9 @@ services:
     environment:
       # 容器内 localhost 指向容器自身，需按实际部署环境修改为真实后端地址
       # 部署在同一台宿主机时可用 host.docker.internal
-      JAVA_API_BASE_URL: http://host.docker.internal:48080/admin-api/
-      MONGODB_URL: mongodb://host.docker.internal:27017
+      environment:
+      JAVA_API_BASE_URL: http://134.175.217.240/admin-api/
+      MONGODB_URL: mongodb://134.175.217.240:27017
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       # SQLite 数据落到挂载卷，避免容器重建丢失
       DATABASE_URL: sqlite:////app/data/aigc_platform.db

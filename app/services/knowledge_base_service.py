@@ -316,7 +316,16 @@ async def update_chat(id: str, answer: str, status: int = 1, errorMsg: str = "")
         "answer": answer,
         "errorMsg": errorMsg,
     }
-    return await API.put("/api/ai/chat/update", body)
+    try:
+        return await API.put("/api/ai/chat/update", body)
+    except Exception as e:
+        # 该函数常被 fire-and-forget 调用，网络/超时等异常若不兜底会静默丢失
+        # （只出现 "Task exception was never retrieved"），此处显式打日志便于定位
+        logger.error(
+            f"[业务状态回调] 回写 Java 消息失败: id={id} status={status} "
+            f"url={settings.java_api_base_url}/api/ai/chat/update error={e}"
+        )
+        return {"code": 500, "msg": str(e)[:200], "data": None, "success": False}
 
 # 获取滚动窗口消息
 async def get_chat_window(sessionId: str, ) -> dict:

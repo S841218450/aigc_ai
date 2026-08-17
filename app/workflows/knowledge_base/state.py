@@ -6,6 +6,10 @@ from app.workflows.common.baseState import BaseState
 class KnowledgeBaseState(BaseState):
     params: Dict[str, Any]
 
+    # ---------- 节点执行摘要（SSE 回传前端；未声明时 LangGraph 会从节点更新中丢弃该 key，
+    # 导致 build_node_data 的 messages 分支回退到完整 answer，最后一条事件重复透传全文）----------
+    agent_log: Optional[str]
+
     # ---------- 多轮对话记忆（滑动窗口现取 + 近期摘要，由 /query 组装后注入）----------
     chat_history: Optional[List[Dict[str, Any]]] = None
     # 超出滑动窗口的早期历史摘要（Agent 自持，增量滚动生成）
