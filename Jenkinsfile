@@ -25,7 +25,10 @@ pipeline {
         stage('构建Docker镜像') {
             steps {
                 sh """
-                    docker build -t ${APP_IMAGE}:${APP_TAG} .
+                    # 启用 BuildKit 并以上一版 latest 作为缓存基线：
+                    # requirements.txt 未变化时依赖层（pip install）直接复用，避免每次全量重装
+                    export DOCKER_BUILDKIT=1
+                    docker build --cache-from=${APP_IMAGE}:latest -t ${APP_IMAGE}:${APP_TAG} .
                     docker tag ${APP_IMAGE}:${APP_TAG} ${APP_IMAGE}:latest
                     echo "✅ 镜像构建完成 ${APP_IMAGE}:${APP_TAG}"
                 """
@@ -84,6 +87,17 @@ pipeline {
                                 fi
                                 sleep 1
                             done
+
+                            # 清理历史构建号镜像（保留当前版本与 latest），避免旧镜像堆积占用磁盘
+                            OLD_IMAGES=\$(docker images ${APP_IMAGE} --format '{{.Repository}}:{{.Tag}}' \
+                                | grep -v -E ":latest\$|:${APP_TAG}\$" || true)
+                            if [ -n "\${OLD_IMAGES}" ]; then
+                                echo "清理旧版本镜像:"
+                                echo "\${OLD_IMAGES}"
+                                echo "\${OLD_IMAGES}" | xargs docker rmi -f
+                            else
+                                echo "无旧版本镜像需清理"
+                            fi
 
                             docker image prune -f
                             echo "✅ 服务正常运行"

@@ -34,6 +34,12 @@ MODEL_NAME_MAP = {
     "default": DEFAULT_IMAGE_MODEL,
 }
 
+# 模型降级链：高配模型调用失败（异常或空结果）时依次降级到低配模型
+MODEL_FALLBACK_CHAIN = {
+    "doubao-seedream-5-0-pro-260628": ["doubao-seedream-5-0-260128","qwen-image-2.0-pro-2026-06-22"],
+    "qwen-image-3.0-pro": ["qwen-image-3.0", "qwen-image-2.0-pro-2026-06-22"],
+}
+
 # 参考图相关：模型侧单张图片上限（qwen-image 文档要求不超过 10MB）
 MAX_REF_IMAGE_BYTES = 10 * 1024 * 1024
 REF_IMAGE_DOWNLOAD_TIMEOUT = 30.0
@@ -106,6 +112,21 @@ async def _ref_image_to_data_uri(url: str) -> str:
         raise RuntimeError(f"参考图下载失败（可能无访问权限）: {e}") from e
 
 
+async def _invoke_image_model(
+    client, model_name: str, prompt: str,
+    params: Optional[dict], config: Optional[dict], images: list[str],
+) -> list[str]:
+    """按模型厂商分发到对应厂商服务，返回图片 URL 列表（不含保存逻辑）。"""
+    if model_name.startswith("qwen") or model_name.startswith("wan"):
+        return await generate_qwen_images(
+            model_name, prompt, images=images, params=params or {},
+        )
+    else:
+        return await generate_seedream_images(
+            client, model_name, prompt, params=params, config=config, images=images,
+        )
+
+
 async def generate_images_and_save(
     client,
     *,
@@ -141,24 +162,22 @@ async def generate_images_and_save(
         # 私有 COS 参考图模型直接拉会 403（防盗链），先下载成 base64 data URI 再传给模型
         logger.info("参考图共 %s 张，开始下载并转 base64 供模型使用", len(image_list))
         image_list = [await _ref_image_to_data_uri(url) for url in image_list]
-    if model_name.startswith("qwen") or model_name.startswith("wan"):
-        # 千问/万相：参数统一由 qwen.py 内部分层组装（公共配置 + 各模型专属配置）
-        image_urls = await generate_qwen_images(
-            model_name,
-            prompt,
-            images=image_list,
-            params=params or {},
-        )
-    else:
-        # 火山引擎 Seedream
-        image_urls = await generate_seedream_images(
-            client,
-            model_name,
-            prompt,
-            params=params,
-            config=config,
-            images=image_list,
-        )
+    # 降级链：高配模型调用失败（异常或空结果）时依次降级到低配模型
+    fallback_chain = [model_name] + MODEL_FALLBACK_CHAIN.get(model_name, [])
+    image_urls: list[str] = []
+    for i, try_model in enumerate(fallback_chain):
+        try:
+            image_urls = await _invoke_image_model(client, try_model, prompt, params, config, image_list)
+            if not image_urls:
+                raise RuntimeError(f"模型 {try_model} 返回空结果")
+            if try_model != model_name:
+                logger.warning("原模型 %s 调用失败，已降级到 %s 生图成功", model_name, try_model)
+            break
+        except Exception as e:
+            logger.warning("模型 %s 生图失败: %s", try_model, e)
+            if i == len(fallback_chain) - 1:
+                raise
+            logger.info("尝试降级到 %s", fallback_chain[i + 1])
 
     res_count = len(image_urls)
     logger.info("模型%s生成了%d张图片", model_name, res_count)

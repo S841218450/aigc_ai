@@ -5,7 +5,6 @@ from app.workflows.knowledge_base.nodes import (
     chat_answer_node,
     retrieval_agent_node,
     answer_node,
-    confidence_evaluation_node,
     format_response_node,
 )
 from app.workflows.knowledge_base.router import kb_needed_router
@@ -22,7 +21,6 @@ class KnowledgeBaseGraph:
         workflow.add_node("chat_answer", chat_answer_node)  # 闲聊/功能咨询（无需检索，直接回答结束）
         workflow.add_node("retrieval_agent", retrieval_agent_node)  # 检索 agent（工具查证据，推进度）
         workflow.add_node("answer", answer_node)  # 回答节点（基于检索证据流式生成）
-        workflow.add_node("confidence_evaluation", confidence_evaluation_node)  # 置信度评估
         workflow.add_node("format_response", format_response_node)  # 格式化响应（只补 sources）
 
         workflow.set_entry_point("intent_recognition")
@@ -39,10 +37,9 @@ class KnowledgeBaseGraph:
         )
         workflow.add_edge("chat_answer", END)
 
-        # 检索 agent → 回答节点 → 置信度评估 → 格式化响应（检索与生成解耦，证据经 state 显式传递）
+        # 检索 agent → 回答节点 → 格式化响应（检索与生成解耦，证据经 state 显式传递）
         workflow.add_edge("retrieval_agent", "answer")
-        workflow.add_edge("answer", "confidence_evaluation")
-        workflow.add_edge("confidence_evaluation", "format_response")
+        workflow.add_edge("answer", "format_response")
         workflow.add_edge("format_response", END)
 
         return workflow.compile(debug=True)
@@ -76,8 +73,6 @@ class KnowledgeBaseGraph:
             kg_entities=None,
             kg_validated=None,
             context=None,
-            confidence_score=None,
-            has_reliable_source=None,
             sources=None,
             retrieval_strategy=None,
             next_step=None,

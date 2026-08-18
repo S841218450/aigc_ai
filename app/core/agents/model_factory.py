@@ -91,11 +91,12 @@ def get_model(role: ModelType, config: Optional[dict] = None):
             **base_chat_cfg
         )
     elif role == "Reviewer":
-        # 结果校验
+        # 结果校验：仅做结构化评估，不需要深度思考。
         return ChatOpenAI(
             model="glm-5.2",
             temperature=0.2,
-            max_tokens=2048,
+            max_tokens=8192,
+            extra_body={"thinking": {"type": "disabled"}},
             **base_chat_cfg
         )
     elif role == "intent":

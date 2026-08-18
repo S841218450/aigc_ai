@@ -110,7 +110,6 @@ async def chat_answer_node(state: KnowledgeBaseState, writer: StreamWriter) -> K
     return {
         "agent_log": f"闲聊/功能咨询回答完成，问题: {query}",
         "answer": answer,
-        "has_reliable_source": False,
         "sources": [],
     }
 
@@ -235,40 +234,6 @@ async def answer_node(state: KnowledgeBaseState, writer: StreamWriter) -> Knowle
     return {
         "agent_log": f"回答完成，问题: {query}",
         "answer": answer,
-    }
-
-
-async def confidence_evaluation_node(state: KnowledgeBaseState) -> KnowledgeBaseState:
-    """置信度评估节点：基于主查询 agent 的检索上下文评估回答可靠性。"""
-
-    class ConfidenceOutput(BaseModel):
-        confidence_score: float = Field(description="置信度分数 0-1")
-        has_reliable_source: bool = Field(description="是否达到可靠标准")
-        analysis: str = Field(description="评估分析")
-        missing_points: List[str] = Field(description="缺失信息点")
-
-    llm = get_model('Reviewer')
-    query = state.get("question", "")
-    answer = state.get("answer", "")
-    context = state.get("context", "")
-
-    if not context or "未找到" in answer:
-        return {
-            "agent_log": "无可靠来源，置信度校验不通过",
-            "confidence_score": 0.0,
-            "has_reliable_source": False,
-        }
-
-    prompt_template = get_prompt('knowledge', 'confidence_evaluation')
-    prompt = prompt_template.format(query=query, answer=answer, context=context)
-
-    structured_llm = llm.with_structured_output(ConfidenceOutput)
-    result: ConfidenceOutput = await structured_llm.ainvoke(prompt)
-
-    return {
-        "agent_log": f"置信度评估完成，分数: {result.confidence_score:.2f}，可靠来源: {result.has_reliable_source}，分析: {result.analysis}",
-        "confidence_score": result.confidence_score,
-        "has_reliable_source": result.has_reliable_source,
     }
 
 

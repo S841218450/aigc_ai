@@ -43,9 +43,6 @@ class KnowledgeBaseState(BaseState):
     context: Optional[str]
     answer: Optional[str]
 
-    confidence_score: Optional[float]
-    has_reliable_source: Optional[bool]
-
     sources: Optional[List[Dict[str, Any]]]
 
     retrieval_strategy: Optional[str]

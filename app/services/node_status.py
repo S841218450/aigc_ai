@@ -95,14 +95,6 @@ def build_node_data(node_name: str, state_update: dict, node_map: dict = None) -
         return {
             "sources": state_update.get("sources", []),
             "answer": state_update.get("answer", ""),
-            "confidence_score": state_update.get("confidence_score"),
-            "has_reliable_source": state_update.get("has_reliable_source"),
-            "messages": state_update.get("agent_log", ""),
-        }
-    elif data_key == "confidence":
-        return {
-            "confidence_score": state_update.get("confidence_score"),
-            "has_reliable_source": state_update.get("has_reliable_source"),
             "messages": state_update.get("agent_log", ""),
         }
     else:
@@ -175,12 +167,6 @@ KNOWLEDGE_BASE_NODE_MAP = {
     "generate_answer": {
         "type": "step_generate",
         "status": "正在生成答案",
-        "data_key": "messages",
-    },
-    "confidence_evaluation": {
-        "type": "step_confidence",
-        "status": "正在评估答案置信度",
-        "data_key": "confidence",
     },
     "format_response": {
         "type": "step_format",
